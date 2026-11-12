@@ -63,7 +63,8 @@ HartwellApacheError_CL
 | project OriginalTime, Level, Module, Message
 | sort by OriginalTime asc
 ```
-width="660" height="601" alt="Screenshot 2026-11-11 171430" src="https://github.com/user-attachments/assets/b58a1d20-b374-48f5-b0f3-f3636d6a370c" />
+<img width="738" height="752" alt="Screenshot 2026-11-11 171355" src="https://github.com/user-attachments/assets/b204eecc-4648-4904-bd2c-403998444018" />
+
 
 
 The messages were cut off, so I grouped them to see each unique message in full.
