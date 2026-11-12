@@ -39,7 +39,8 @@ HartwellApache_CL
 | sort by Hits desc
 ```
 
-![Apache scan](screenshots/01-apache-scan.png)
+<img width="931" height="832" alt="Screenshot 2026-11-11 170327" src="https://github.com/user-attachments/assets/a247a87f-1133-434a-8710-8eb3652b0b2a" />
+
 
 192.168.1.100 kept showing up with a different user agent each time (Android, iPhone, Windows, Mac), which a normal visitor wouldn't do. One of its user agents gave away the tool: `Nmap Scripting Engine`. The other busy IP, 192.168.1.120, is the server itself.
 
@@ -62,8 +63,8 @@ HartwellApacheError_CL
 | project OriginalTime, Level, Module, Message
 | sort by OriginalTime asc
 ```
+width="660" height="601" alt="Screenshot 2026-11-11 171430" src="https://github.com/user-attachments/assets/b58a1d20-b374-48f5-b0f3-f3636d6a370c" />
 
-![Error log first look](screenshots/02-error-log-first-look.png)
 
 The messages were cut off, so I grouped them to see each unique message in full.
 
@@ -74,13 +75,15 @@ HartwellApacheError_CL
 | summarize Count = count() by Message
 ```
 
-![Error log summary](screenshots/03-error-log-summary.png)
+<img width="660" height="601" alt="Screenshot 2026-11-11 171430" src="https://github.com/user-attachments/assets/2251bbcd-836e-42e2-97cd-ac3586bf3499" />
+
 
 Three PHP session warnings repeated 25 times each ("Session ID is too long," "Failed to read session data," "Failed to write session data"). These come from PHP's session upload progress feature, which is the bug this exploit targets (CVE-2026-109618 / CVE-2026-109619).
 
 - **Flag 3:** `session.upload_progress`
 
 ### Flag 4: Exploit Delivery
+
 
 Since the bug is in the upload feature, I expected the exploit to look like a file upload. I compared request methods and content types.
 
@@ -91,7 +94,8 @@ HartwellHTTPEnriched_CL
 | sort by Requests desc
 ```
 
-![Exploit requests](screenshots/04-exploit-requests.png)
+<img width="707" height="558" alt="Screenshot 2026-11-11 171805" src="https://github.com/user-attachments/assets/c0c46f07-136d-48d7-ac6e-76e84ade44df" />
+
 
 Normal browsing is GET. The attacker sent POST requests with `multipart/form-data`, one with the boundary `----0x4148php2shell`. PHP only runs the upload progress code on real file uploads, so the attacker had to fake one to reach the bug.
 
@@ -126,7 +130,8 @@ HartwellHTTPEnriched_CL
 | take 10
 ```
 
-![Encoded commands](screenshots/05-encoded-commands.png)
+<img width="755" height="670" alt="Screenshot 2026-11-11 173017" src="https://github.com/user-attachments/assets/28043641-20ae-4f88-b46f-cc141df7b0f9" />
+
 
 Every command came in through the `X-HMG-Debug` header. Apache's normal access log doesn't record custom headers, so this only shows up in the enriched HTTP log.
 
@@ -149,7 +154,8 @@ HartwellHTTPEnriched_CL
 | sort by OriginalTime asc
 ```
 
-![All webshell commands](screenshots/06-all-webshell-commands.png)
+<img width="928" height="902" alt="Screenshot 2026-11-11 173447" src="https://github.com/user-attachments/assets/b44c3eb5-9651-4d90-9c23-6a84f8bb96d3" />
+
 
 It starts at 14:01 UTC with basic checks (`id`, `whoami`, `uname -a`, `hostname`) and moves into network discovery, security tool checks, and the config file.
 
@@ -165,7 +171,8 @@ HartwellHTTPEnriched_CL
 | sort by OriginalTime asc
 ```
 
-![Network discovery](screenshots/07-network-discovery.png)
+<img width="820" height="651" alt="Screenshot 2026-11-11 173525" src="https://github.com/user-attachments/assets/c2e9e6a9-5359-4b73-aab8-eac0a4fa8ad0" />
+
 
 `ip a` / `ip addr show` shows what network the server is on, `ip neigh` shows nearby machines, and `ss -tlnp` shows what's listening.
 
@@ -199,7 +206,8 @@ HartwellHTTPEnriched_CL
 | sort by OriginalTime asc
 ```
 
-![Database dump](screenshots/08-database-dump.png)
+<img width="813" height="516" alt="Screenshot 2026-11-11 180841" src="https://github.com/user-attachments/assets/79e5aeda-dea6-4a29-b58a-25409bbbb212" />
+
 
 They logged into MySQL as `wpuser` (with the password `wp_lab_2026` typed right on the command line) and ran `SELECT user_login,user_pass FROM wp_users`. `wp_users` is the user table and `user_pass` holds the password hashes. The last query dumped the whole table into base64.
 
@@ -221,7 +229,8 @@ HartwellHTTPEnriched_CL
 | sort by OriginalTime asc
 ```
 
-![Stop monitoring attempts](screenshots/09-stop-monitoring.png)
+<img width="796" height="432" alt="Screenshot 2026-11-11 174359" src="https://github.com/user-attachments/assets/471fef47-496d-45b6-a99b-6ff3cd15d48c" />
+
 
 They listed running services, ran `systemctl stop` on sysmon and SplunkForwarder, then checked all three with `systemctl is-active sysmon auditd SplunkForwarder`.
 
@@ -246,7 +255,8 @@ HartwellHTTPEnriched_CL
 | sort by OriginalTime asc
 ```
 
-![Cron and implant](screenshots/10-cron-implant.png)
+<img width="943" height="666" alt="Screenshot 2026-11-11 174710" src="https://github.com/user-attachments/assets/d23a073b-d3ff-4e6b-9966-4d4d415ee630" />
+
 
 At 14:15 they copied a file to `/dev/shm/.cache-helper` and made it executable. At 14:16 they added a cron job to run it every 5 minutes.
 
@@ -271,7 +281,8 @@ HartwellHTTPEnriched_CL
 | sort by OriginalTime asc
 ```
 
-![Base64 exfiltration](screenshots/11-base64-exfil.png)
+<img width="782" height="670" alt="Screenshot 2026-11-11 180854" src="https://github.com/user-attachments/assets/790799c5-2c42-4799-942d-592eee660542" />
+
 
 They ran `base64 /var/www/html/wp-config.php` and `SELECT * FROM wp_users | base64`. The webshell sent the encoded output back in its web response, so no separate channel was needed.
 
