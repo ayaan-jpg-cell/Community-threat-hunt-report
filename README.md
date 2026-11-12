@@ -1,59 +1,36 @@
-# Threat Hunt Report: PHP2Shell, The Hartwell Breach
+# Threat Hunt: PHP2Shell, The Hartwell Breach
 
 **Date:** November 2026
 **Analyst:** Ayaan Sheikh
-**Difficulty:** Easy | **Result:** 18 / 18 flags
+**Result:** 18 / 18 flags (1750 / 1750)
 
-## Platforms and Tools Used
+## Tools Used
 
-- **Platform:** Azure Log Analytics workspace (LAW-HuntPractice), Microsoft Sentinel
-- **Target host:** debian13 (192.168.1.120), Debian 13 running WordPress 7.1.3, Apache 2.4.69, PHP 8.4.4
-- **Log sources:** Apache access log, Apache error log, Sysmon for Linux, auditd, enriched HTTP log (from packet capture), syslog, auth.log
-- **Languages & Tools:** Kusto Query Language (KQL), Python (to check the encoding order)
+- Azure Log Analytics (LAW-HuntPractice) / Microsoft Sentinel
+- KQL
+- Logs: Apache access and error logs, enriched HTTP logs, Sysmon for Linux, auditd
+- Target: debian13 (192.168.1.120), a WordPress server on Debian 13
 
-## Scenario Summary
+## Scenario
 
-Hartwell Medical Group runs a public WordPress site for patient scheduling. On 23 October 2026, the on-call SOC analyst got a cluster of auditd alerts showing the `www-data` account writing files into the Apache webroot. That account runs the Apache worker processes and should never spawn shells, run discovery commands, or write files outside the WordPress uploads folder.
+Hartwell Medical Group runs a WordPress site for patient scheduling. On 23 October 2026 the SOC got alerts showing the `www-data` account (the account Apache runs as) writing files into the web folder. That account should never be running commands or writing files there. My job was to find out who did it, how they got in, what they did, and whether they spread to other machines.
 
-My job was to figure out who did this, how they got in, what they did once inside, what they took, and whether they spread to other machines.
+## What Happened
 
-**What I found:** an attacker at 192.168.1.100 scanned the site with Nmap, exploited PHP's session upload progress feature to drop a webshell called `health-check.php`, and controlled it through a hidden HTTP header with encoded commands. They explored the server, stole the WordPress database password and every user's password hash, tried and failed to shut off the monitoring tools, and set up a cron job to keep access. They never moved to another machine.
+An attacker at **192.168.1.100** scanned the site with **Nmap**, then exploited a bug in PHP's **session upload progress** feature to drop a webshell called **health-check.php**. They sent commands to it through a hidden HTTP header, looked around the server, stole the WordPress database login and user password hashes, and tried to shut off the security tools. That failed because they didn't have root. They set up a **cron job** to keep access and never moved to another machine.
 
-**Attack window:** 23 Oct 2026, 04:00 to 16:00 UTC
+## How I Hunted
 
-## How I Approached the Hunt
-
-The hunt is split into 8 sections that follow the attack from start to finish. My general method was:
-
-1. **Filter first.** Every query is limited to the attack window. All Hartwell tables have an `OriginalTime` column with the real event time. `TimeGenerated` is just when the log was ingested, so I always filtered on `OriginalTime`.
-2. **Start broad, then narrow.** I'd count or summarize first to find what stands out, then filter down to the attacker and look at the actual events.
-3. **Pivot between tables.** The access log shows who connected, the error log shows what broke, the enriched HTTP log shows what was hidden in the requests, and Sysmon shows what ran on the host.
-4. **Use what I already found.** Once I had the attacker IP, the webshell name, and the hidden header, most of the later flags came from one table of decoded commands.
-
-### Getting set up (the part that took the longest)
-
-My first queries all failed with `Failed to resolve table or column expression named 'HartwellApache_CL'`, and the table name was underlined red. The query was fine. I was just in the wrong place. I listed every table I could see and none of the Hartwell tables were there:
-
-```kql
-union withsource=TableName *
-| where TimeGenerated > ago(30d)
-| summarize Rows=count() by TableName
-| order by TableName asc
-```
-
-The fix was opening `LAW-HuntPractice` from inside the `Cyber-Range-2-Admin-SOC` resource group in the Azure portal, then switching the query editor from **Simple mode** to **KQL mode**. After that the starter query returned data.
+- Every Hartwell table has an `OriginalTime` column with the real event time, so I filtered every query on it. The attack window was 23 Oct 2026, 04:00 to 16:00 UTC.
+- I started with counts and summaries to find what stood out, then filtered down to the attacker to read the actual events.
 
 ---
 
-## 🔎 Flag Analysis & Findings
+## Section 1: First Contact
 
-### Section 1: First Contact (Reconnaissance)
+### Flags 1 and 2: The Scanner and Reconnaissance Tool
 
-#### 🏁 Flag 1 – The Scanner
-
-**Goal:** Find the external IP that generated far more traffic than the staff baseline.
-
-**My approach:** The brief says staff connect from 192.168.1.50 and 192.168.1.80. A scanner hits a lot of pages fast, so I counted requests per IP in the Apache access log. I also grouped by user agent and counted distinct paths, because scanners usually request many different URLs.
+I was looking for an outside IP sending far more traffic than the staff IPs (192.168.1.50 and .80). I counted requests by IP and user agent.
 
 ```kql
 HartwellApache_CL
@@ -62,31 +39,33 @@ HartwellApache_CL
 | sort by Hits desc
 ```
 
-**What I found:** 192.168.1.100 showed up over and over with a different user agent each time: Android, iPhone, iPad, Windows, Mac, Linux, Firefox, Chrome. A real person uses one browser, so cycling through that many is someone trying to look like normal traffic. The other big IP, 192.168.1.120, is the web server itself, so it isn't external. The staff IPs barely appeared. The environment topology also listed 192.168.1.100 as the only "external workstation."
+![Apache scan](screenshots/01-apache-scan.png)
 
-**Answer:** `192.168.1.100`
+192.168.1.100 kept showing up with a different user agent each time (Android, iPhone, Windows, Mac), which a normal visitor wouldn't do. One of its user agents gave away the tool: `Nmap Scripting Engine`. The other busy IP, 192.168.1.120, is the server itself.
 
-![Flags 1 and 2: request counts by IP and user agent](screenshots/flag01-02-scanner-and-nmap.png)
-
-#### 🏁 Flag 2 – Reconnaissance Tool
-
-**Goal:** Identify the scanning tool the attacker used.
-
-**My approach:** Scanning tools usually write their own name into the user agent string, while browsers say things like "Chrome" or "Safari." Since I already had every user agent for 192.168.1.100 from the Flag 1 query, I went through those rows looking for one that wasn't a browser.
-
-**What I found:** One user agent gave it away: `Mozilla/5.0 (compatible; Nmap Scripting Engine; https://nmap.org/book/nse.html)` with 93 hits. The Nmap Scripting Engine can probe web servers for versions and known weaknesses, which fits "identifying the web stack."
-
-**Answer:** `Nmap`
+- **Flag 1:** `192.168.1.100`
+- **Flag 2:** `Nmap`
 
 ---
 
-### Section 2: The Exploit (Initial Access)
+## Section 2: The Exploit
 
-#### 🏁 Flag 3 – Error Trail
+### Flag 3: Error Trail
 
-**Goal:** Find which PHP feature generated the warnings during exploitation.
+Exploits usually leave errors behind, so I checked the Apache error log for the attacker IP.
 
-**My approach:** Failed exploit attempts usually leave errors behind, so I moved to the Apache error log and filtered to the attacker IP. My first attempt projected each row, but the messages were cut off and I couldn't read the important part. So I switched to summarizing by message, which shows each unique message once with a count.
+```kql
+HartwellApacheError_CL
+| where OriginalTime between (datetime("2026-10-23 04:00") .. datetime("2026-10-23 16:00"))
+| where ClientIP == "192.168.1.100"
+| where Message has "session"
+| project OriginalTime, Level, Module, Message
+| sort by OriginalTime asc
+```
+
+![Error log first look](screenshots/02-error-log-first-look.png)
+
+The messages were cut off, so I grouped them to see each unique message in full.
 
 ```kql
 HartwellApacheError_CL
@@ -95,25 +74,15 @@ HartwellApacheError_CL
 | summarize Count = count() by Message
 ```
 
-**What I found:** Three PHP warnings repeated exactly 25 times each, all starting with "PHP Request Startup":
+![Error log summary](screenshots/03-error-log-summary.png)
 
-- Session ID is too long or contains illegal characters
-- Failed to read session data: files
-- Failed to write session data (files)
+Three PHP session warnings repeated 25 times each ("Session ID is too long," "Failed to read session data," "Failed to write session data"). These come from PHP's session upload progress feature, which is the bug this exploit targets (CVE-2026-109618 / CVE-2026-109619).
 
-PHP only touches session data at request startup like this when a request includes an upload progress field. So the attacker was sending crafted values into the session through PHP's session upload progress feature. The case brief also says the exploit was a bug in PHP's `session.upload_progress` handler, so this lined up.
+- **Flag 3:** `session.upload_progress`
 
-**Answer:** `session.upload_progress`
+### Flag 4: Exploit Delivery
 
-![Flag 3: unique error messages from the attacker IP](screenshots/flag03-error-messages.png)
-
-**Something extra I noticed:** the same results had PHP parse errors from `/var/www/html/health-check.php` running code through `eval()`, with pieces like "inet", "DB_NAME", "splunk" and "SELECT" in them. That looked like a webshell leaking the attacker's commands, so I wrote it down for later.
-
-#### 🏁 Flag 4 – Exploit Delivery
-
-**Goal:** Find the HTTP method and content type that separates exploit traffic from normal browsing.
-
-**My approach:** The upload progress feature only works on file uploads, so I expected the exploit to look like a file upload. I used the enriched HTTP log because it has the `content_type` field, and compared the attacker's request types.
+Since the bug is in the upload feature, I expected the exploit to look like a file upload. I compared request methods and content types.
 
 ```kql
 HartwellHTTPEnriched_CL
@@ -122,63 +91,31 @@ HartwellHTTPEnriched_CL
 | sort by Requests desc
 ```
 
-**What I found:** Most traffic was GET with no content type, which is normal browsing. The attacker also sent several POST requests with `multipart/form-data`, the content type used for file uploads. One of them even had the boundary `----0x4148php2shell`, which is basically the attacker signing their work.
+![Exploit requests](screenshots/04-exploit-requests.png)
 
-**Why this content type:** PHP only runs the upload progress code when it sees a real file upload, and that only happens with multipart/form-data. A normal form post never touches that code, so the attacker had to fake a file upload to hit the bug.
+Normal browsing is GET. The attacker sent POST requests with `multipart/form-data`, one with the boundary `----0x4148php2shell`. PHP only runs the upload progress code on real file uploads, so the attacker had to fake one to reach the bug.
 
-**Answer:** `POST, multipart/form-data`
+- **Flag 4:** `POST, multipart/form-data`
 
-![Flag 4: HTTP method and content type](screenshots/flag04-post-multipart.png)
+### Flag 5: The Payload
 
-#### 🏁 Flag 5 – The Payload
+The error summary above also showed PHP errors from `/var/www/html/health-check.php` running code with `eval()`, with pieces like "DB_NAME" and "SELECT" in them. That's the webshell. The name is meant to look like a normal health check page.
 
-**Goal:** Find the new file that appeared in the web root after the exploit.
-
-**My approach:** I already had a strong lead from Flag 3: the parse errors pointed to `/var/www/html/health-check.php`, and `/var/www/html` is the web root. To confirm it was the attacker's file, I checked who requested it and when it was first seen.
-
-```kql
-HartwellApache_CL
-| where OriginalTime between (datetime("2026-10-23 04:00") .. datetime("2026-10-23 16:00"))
-| where URI has "health-check.php"
-| summarize FirstSeen = min(OriginalTime), Hits = count() by SourceIP
-| sort by FirstSeen asc
-```
-
-**What I found:** `health-check.php` is the webshell. The name was chosen to sound like a normal monitoring page so an admin looking at the folder wouldn't think twice about it.
-
-**Answer:** `health-check.php`
-
-![Flag 5: first requests to health-check.php](screenshots/flag05-webshell.png)
+- **Flag 5:** `health-check.php`
 
 ---
 
-### Section 3: Remote Control (Execution)
+## Section 3: Remote Control
 
-#### 🏁 Flag 6 – The Operator
+### Flag 6: The Operator
 
-**Goal:** Find which Linux account the webshell ran commands as.
+A webshell runs inside the web server, so its commands run as the web server's account. Apache runs as www-data, which has no admin rights. That becomes important in Section 6.
 
-**My approach:** A webshell runs inside the web server, so its commands run as whatever account the web server uses. The brief says Apache runs as `www-data`. I confirmed it by looking at process creation events in Sysmon for that user.
+- **Flag 6:** `www-data`
 
-```kql
-HartwellSysmon_CL
-| where OriginalTime between (datetime("2026-10-23 04:00") .. datetime("2026-10-23 16:00"))
-| where RuleName == "ProcessCreate" and User has "www-data"
-| project OriginalTime, Image, CommandLine, ParentImage, User
-| sort by OriginalTime asc
-```
+### Flags 7 and 8: Hidden Trigger and Encoded Orders
 
-**What I found:** Commands like `id`, `whoami` and `uname` running as `www-data`, which should never happen on a normal web server. This mattered later, because www-data is a low privilege account.
-
-**Answer:** `www-data`
-
-![Flag 6: processes run as www-data](screenshots/flag06-www-data.png)
-
-#### 🏁 Flag 7 – Hidden Trigger
-
-**Goal:** Find the custom HTTP header the webshell used to receive commands.
-
-**My approach:** A basic webshell takes commands in the URL, like `?cmd=whoami`, and those would show up plainly in the access log. I didn't see anything like that, so the commands had to be hidden somewhere else. Going through the data dictionary, the enriched HTTP log had two unusual columns: `x_hmg_debug_raw` ("Raw X-HMG-Debug header value (encoded)") and `x_hmg_debug_decoded` ("Decoded X-HMG-Debug command"). I pulled the rows where that header had a value.
+There was nothing like `?cmd=` in the URLs, so the commands were hidden somewhere else. The HTTP table had columns for a custom header called `X-HMG-Debug`, so I compared its raw and decoded values.
 
 ```kql
 HartwellHTTPEnriched_CL
@@ -186,33 +123,23 @@ HartwellHTTPEnriched_CL
 | where isnotempty(x_hmg_debug_raw)
 | project OriginalTime, x_hmg_debug_raw, x_hmg_debug_decoded
 | sort by OriginalTime asc
+| take 10
 ```
 
-**What I found:** Every webshell command came in through a header called `X-HMG-Debug`. The name sounds like a harmless debug setting. Apache's access log doesn't record custom headers, so in the normal logs this just looks like ordinary requests to health-check.php. It only shows up in the HTTP log built from packet capture.
+![Encoded commands](screenshots/05-encoded-commands.png)
 
-**Answer:** `X-HMG-Debug`
+Every command came in through the `X-HMG-Debug` header. Apache's normal access log doesn't record custom headers, so this only shows up in the enriched HTTP log.
 
-#### 🏁 Flag 8 – Encoded Orders
+The raw values end in `=`, a sign of Base64. Base64 decoding `ZmxmZ3J6KCJ2cSIpOw==` gives `flfgrz("vq");`, and ROT13 turns that into `system("id");`. So the attacker applied ROT13 first, then Base64. Every value starts with `ZmxmZ3J6` because every command starts with `system(`.
 
-**Goal:** Identify the two encoding methods used on the commands, and the order they were applied in.
-
-**My approach:** Using the same query as Flag 7, I compared the raw header value with the decoded command. The raw values like `ZmxmZ3J6KCJ2cSIpOw==` end in `=`, which is a classic sign of Base64. I decoded a few in Python to see what was underneath.
-
-**What I found:** Base64 decoding `ZmxmZ3J6KCJ2cSIpOw==` gave `flfgrz("vq");`, which still wasn't readable. Each letter looked shifted, and shifting by 13 (ROT13) turned it into `system("id");`, matching the decoded column. `whoami` worked the same way.
-
-So the attacker applied **ROT13 first, then Base64**, and the webshell reverses it. PHP has built-in functions for both (`str_rot13` and `base64_encode`), which is probably why they were chosen.
-
-Detection idea: every command starts with `system(`, so every encoded header starts with the same string, `ZmxmZ3J6`. That's an easy thing to alert on.
-
-**Answer:** `ROT13, Base64`
-
-![Flag 8: raw vs decoded header values](screenshots/flag08-encoded-headers.png)
+- **Flag 7:** `X-HMG-Debug`
+- **Flag 8:** `ROT13, Base64`
 
 ---
 
-### Section 4: Mapping the Territory (Discovery)
+## Section 4: Mapping the Territory
 
-At this point I realized the `x_hmg_debug_decoded` column was basically the attacker's full command history. So for the rest of the hunt, my main query was every decoded command in time order:
+The decoded column is basically the attacker's full command history, so I pulled all of it in order.
 
 ```kql
 HartwellHTTPEnriched_CL
@@ -222,15 +149,13 @@ HartwellHTTPEnriched_CL
 | sort by OriginalTime asc
 ```
 
-This returned 45 commands. The first one, `system("id");`, ran at 14:01:23 UTC.
+![All webshell commands](screenshots/06-all-webshell-commands.png)
 
-![Decoded webshell commands](screenshots/flag10-12-webshell-commands.png)
+It starts at 14:01 UTC with basic checks (`id`, `whoami`, `uname -a`, `hostname`) and moves into network discovery, security tool checks, and the config file.
 
-#### 🏁 Flag 9 – Network Mapping
+### Flag 9: Network Mapping
 
-**Goal:** Identify the three network discovery commands.
-
-**My approach:** In the full command list I spotted `ip a` and `ss -tlnp` early on, but I was only seeing the first 19 of 45 rows. Rather than scroll through everything, I filtered for common Linux networking commands.
+I filtered for networking commands.
 
 ```kql
 HartwellHTTPEnriched_CL
@@ -240,73 +165,53 @@ HartwellHTTPEnriched_CL
 | sort by OriginalTime asc
 ```
 
-**What I found:** Four commands that answer three questions an attacker asks after getting in:
+![Network discovery](screenshots/07-network-discovery.png)
 
-| Question | Command |
-|---|---|
-| What network am I on? | `ip a` / `ip addr show` (same command, short and long form) |
-| Who else is around? | `ip neigh` |
-| What services are listening? | `ss -tlnp` |
+`ip a` / `ip addr show` shows what network the server is on, `ip neigh` shows nearby machines, and `ss -tlnp` shows what's listening.
 
-**Answer:** `ip addr, ss, ip neigh`
+- **Flag 9:** `ip addr, ss, ip neigh`
 
-![Flag 9: network discovery commands](screenshots/flag09-network-discovery.png)
+### Flag 10: Monitoring Awareness
 
-#### 🏁 Flag 10 – Monitoring Awareness
+In the full command list, at 14:02:57 the attacker ran `dpkg -l | grep -iE 'splunk|sysmon|auditd|wazuh|ossec'` to check for security tools. Only Sysmon, auditd and Splunk are installed on this server.
 
-**Goal:** Find which security tools the attacker discovered on the host.
-
-**My approach:** In the full command list (Section 4 query), I looked for anything that checked installed software or running processes.
-
-**What I found:** At 14:02:57 UTC:
-
-```
-dpkg -l 2>/dev/null | grep -iE 'splunk|sysmon|auditd|wazuh|ossec' | head -10
-```
-
-The attacker searched the installed packages for five security tools. The question asks what they **found**, not what they searched for. The brief says this server runs Sysmon for Linux, auditd, and a Splunk Universal Forwarder. Wazuh and OSSEC aren't installed.
-
-**Answer:** `sysmon, auditd, splunk`
+- **Flag 10:** `sysmon, auditd, splunk`
 
 ---
 
-### Section 5: Credential Harvest (Credential Access)
+## Section 5: Credential Harvest
 
-#### 🏁 Flag 11 – The Config File
+### Flag 11: The Config File
 
-**Goal:** Find which config file the attacker read to get database credentials.
+The full command list shows the attacker reading `/var/www/html/wp-config.php` several times with grep and head. That's where WordPress keeps its database login.
 
-**My approach:** WordPress stores its database login in `wp-config.php`. I checked the full command list (Section 4 query) for anything touching it.
+- **Flag 11:** `wp-config.php`
 
-**What I found:** Between 14:03 and 14:08 UTC the attacker read `/var/www/html/wp-config.php` several different ways: `grep -E 'DB_|TABLE_PREFIX'`, `ls -la`, `head -5`, `grep DB_`, and `grep -i AUTH`. That file has the database name, username, password, and the WordPress auth keys.
+### Flag 12: The Database Dump
 
-**Answer:** `wp-config.php`
+Next I looked at what they did with that login.
 
-#### 🏁 Flag 12 – The Database Dump
-
-**Goal:** Name the table they dumped and the column holding the password hashes.
-
-**My approach:** Once an attacker has the database password, the next step is querying the database. I looked for `mysql` commands in the same command list.
-
-**What I found:** Right after reading the config, they logged in with the stolen credentials and ran:
-
-```
-mysql -u wpuser wordpress -e "SELECT user_login,user_pass FROM wp_users"
+```kql
+HartwellHTTPEnriched_CL
+| where OriginalTime between (datetime("2026-10-23 04:00") .. datetime("2026-10-23 16:00"))
+| where x_hmg_debug_decoded has "mysql"
+| project OriginalTime, x_hmg_debug_decoded
+| sort by OriginalTime asc
 ```
 
-`wp_users` is the WordPress users table, and `user_pass` holds the password hashes. They also ran a second query for usernames, emails, and signup dates.
+![Database dump](screenshots/08-database-dump.png)
 
-**Answer:** `wp_users, user_pass`
+They logged into MySQL as `wpuser` (with the password `wp_lab_2026` typed right on the command line) and ran `SELECT user_login,user_pass FROM wp_users`. `wp_users` is the user table and `user_pass` holds the password hashes. The last query dumped the whole table into base64.
+
+- **Flag 12:** `wp_users, user_pass`
 
 ---
 
-### Section 6: Fighting the Watchers (Defense Evasion)
+## Section 6: Fighting the Watchers
 
-#### 🏁 Flag 13 – Targets for Silence
+### Flags 13 and 14: Targets for Silence and Success or Failure
 
-**Goal:** Find the three monitoring services the attacker tried to stop with systemctl.
-
-**My approach:** After finding the monitoring tools in Flag 10, I expected the attacker to try turning them off. Service names can differ from tool names (Splunk's service is `SplunkForwarder`), so I needed the exact commands.
+After finding the security tools, I expected the attacker to try turning them off.
 
 ```kql
 HartwellHTTPEnriched_CL
@@ -316,40 +221,22 @@ HartwellHTTPEnriched_CL
 | sort by OriginalTime asc
 ```
 
-**What I found:**
+![Stop monitoring attempts](screenshots/09-stop-monitoring.png)
 
-| Time (UTC) | Command |
-|---|---|
-| 14:13:21 | `systemctl list-units --type=service --state=running` (list what's running) |
-| 14:14:01 | `systemctl stop sysmon` |
-| 14:14:07 | `systemctl stop SplunkForwarder` |
-| 14:14:14 | `systemctl is-active sysmon auditd SplunkForwarder` (check if it worked) |
+They listed running services, ran `systemctl stop` on sysmon and SplunkForwarder, then checked all three with `systemctl is-active sysmon auditd SplunkForwarder`.
 
-**Answer:** `sysmon, auditd, SplunkForwarder`
+It didn't work. The commands ran as www-data, and stopping system services needs root. The proof is that the logs kept recording everything they did afterward.
 
-![Flag 13: systemctl stop attempts](screenshots/flag13-systemctl-stop.png)
-
-#### 🏁 Flag 14 – Success or Failure
-
-**Goal:** Decide whether the attacker managed to disable any monitoring, and why.
-
-**My approach:** I thought about who ran the commands. Everything ran as `www-data` (Flag 6). Stopping a system service on Debian needs root, and www-data is a normal low privilege account with no sudo.
-
-Then I checked whether the logs agreed. If Sysmon and auditd had really stopped at 14:14, there would be a gap in the logs afterward. Instead, the activity kept getting logged, including the implant being staged at 14:15:49 and the cron job at 14:16:00 (Flags 15 and 16). So the monitoring never stopped.
-
-**Answer:** No. The www-data account does not have root privileges, so it lacked permission to stop the services with systemctl and all monitoring kept running.
-
-**Note:** My first answer had the same idea in different words and was marked wrong. Spelling out "root privileges" and "permission" got it accepted.
+- **Flag 13:** `sysmon, auditd, SplunkForwarder`
+- **Flag 14:** No. The www-data account does not have root privileges, so it lacked permission to stop the services with systemctl and all monitoring kept running.
 
 ---
 
-### Section 7: Digging In (Persistence)
+## Section 7: Digging In
 
-#### 🏁 Flag 15 – The Scheduled Callback
+### Flags 15 and 16: The Scheduled Callback and Hidden Implant
 
-**Goal:** Identify the persistence mechanism.
-
-**My approach:** The question mentions "scheduling recurring execution." On Linux that almost always means cron. I searched the decoded commands for cron activity and for common hiding places for files.
+On Linux, the usual way to keep running something on a schedule is cron, so I searched for cron and common hiding spots.
 
 ```kql
 HartwellHTTPEnriched_CL
@@ -359,43 +246,22 @@ HartwellHTTPEnriched_CL
 | sort by OriginalTime asc
 ```
 
-**What I found:** At 14:16:00 UTC the attacker added a crontab entry: `*/5 * * * * /dev/shm/.cache-helper 300`. That runs the file every 5 minutes, so even if someone deletes the webshell, the attacker's program keeps running.
+![Cron and implant](screenshots/10-cron-implant.png)
 
-**Answer:** `cron job`
+At 14:15 they copied a file to `/dev/shm/.cache-helper` and made it executable. At 14:16 they added a cron job to run it every 5 minutes.
 
-![Flags 15 and 16: implant copy and crontab entry](screenshots/flag15-16-cron-implant.png)
+`/dev/shm` lives in memory, not on disk, so the file disappears on reboot and won't show up in a disk image. The dot in the name hides it from a normal `ls`. The file was just a copy of `/usr/bin/sleep`, so they were probably testing that the cron job works.
 
-#### 🏁 Flag 16 – Hidden Implant
-
-**Goal:** Find the full path of the implant and explain why the location matters.
-
-**My approach:** Same query as Flag 15. The cron job pointed to the file, and the command right before it showed how the file got there.
-
-**What I found:** At 14:15:49 UTC:
-
-```
-cp /usr/bin/sleep /dev/shm/.cache-helper && chmod +x /dev/shm/.cache-helper
-```
-
-Why the location matters:
-
-- `/dev/shm` is stored in **RAM, not on disk**. If the server reboots or gets shut down for investigation, the file disappears, and a disk image taken afterward won't have it.
-- The dot at the start of `.cache-helper` hides it from a normal `ls`.
-- "cache-helper" sounds like something that belongs on a server.
-
-Something interesting: the "implant" is just a copy of `/usr/bin/sleep`, a harmless built-in program. It looks like the attacker was testing that the cron persistence works before swapping in a real payload.
-
-**Answer:** `/dev/shm/.cache-helper`
+- **Flag 15:** `cron job`
+- **Flag 16:** `/dev/shm/.cache-helper`
 
 ---
 
-### Section 8: Damage Assessment (Synthesis)
+## Section 8: Damage Assessment
 
-#### 🏁 Flag 17 – Data Out
+### Flag 17: Data Out
 
-**Goal:** Describe how the stolen data left the server.
-
-**My approach:** I thought about what channel the attacker already had. They didn't need a new one, since the webshell already sends them the output of every command. I searched the decoded commands for encoding that would make data easy to copy out.
+The attacker already had a webshell that sends back command output, so I checked whether they used it to pull data out.
 
 ```kql
 HartwellHTTPEnriched_CL
@@ -405,118 +271,70 @@ HartwellHTTPEnriched_CL
 | sort by OriginalTime asc
 ```
 
-**What I found:** The attacker base64-encoded the stolen data and had the webshell print it back in its HTTP response. They didn't upload anything anywhere or open a new connection. It all went out through the same web traffic they were already using, which is harder to notice.
+![Base64 exfiltration](screenshots/11-base64-exfil.png)
 
-**Answer:** The attacker base64 encoded the wp-config.php contents and database records and pulled them back out in the HTTP responses of the existing health-check.php webshell, so no separate exfiltration channel was used.
+They ran `base64 /var/www/html/wp-config.php` and `SELECT * FROM wp_users | base64`. The webshell sent the encoded output back in its web response, so no separate channel was needed.
 
-![Flag 17: base64 exfiltration commands](screenshots/flag17-base64-exfil.png)
+- **Flag 17:** The attacker base64 encoded the wp-config.php contents and database records and pulled them back out in the HTTP responses of the existing health-check.php webshell, so no separate exfiltration channel was used.
 
-#### 🏁 Flag 18 – Lateral Movement Check
+### Flag 18: Lateral Movement Check
 
-**Goal:** Test a colleague's claim that the attacker moved to other systems on 192.168.1.0/24.
+A coworker thought the attacker moved to other machines. Going through the full command list, they looked at nearby machines with `ip neigh` but never used ssh, scp, nc, or anything else to connect to one.
 
-**My approach:** Instead of assuming the claim was true, I tested it. Moving to another machine on Linux usually means tools like ssh, scp, rsync, or netcat. I searched every decoded command for them.
-
-```kql
-HartwellHTTPEnriched_CL
-| where OriginalTime between (datetime("2026-10-23 04:00") .. datetime("2026-10-23 16:00"))
-| where isnotempty(x_hmg_debug_decoded)
-| where x_hmg_debug_decoded has_any ("ssh", "scp", "rsync", "nc ")
-| project OriginalTime, x_hmg_debug_decoded
-```
-
-**What I found:** Nothing. The attacker looked at the neighbor table with `ip neigh` but never connected to another machine. All their activity stayed on 192.168.1.120.
-
-**Answer:** No, the logs only show local discovery like ip neigh with no ssh, scp, nc or connections to other hosts, so all activity stayed on 192.168.1.120.
-
-![Flag 18: no lateral movement commands found](screenshots/flag18-no-lateral-movement.png)
+- **Flag 18:** No, the logs only show local discovery like ip neigh with no ssh, scp, nc or connections to other hosts, so all activity stayed on 192.168.1.120.
 
 ---
 
-## 🕒 Attack Timeline (UTC, 23 Oct 2026)
+## Timeline (UTC, 23 Oct 2026)
 
-| Time | Activity |
+| Time | What happened |
 |---|---|
-| Morning | Nmap scan and user agent rotation from 192.168.1.100 |
-| 08:18 onward | Session upload progress exploit attempts (PHP session warnings in the error log) |
-| Before 14:01 | Webshell `health-check.php` dropped in `/var/www/html` |
-| 14:01:23 | First webshell command: `id` |
-| 14:01 to 14:02 | System and user discovery (`whoami`, `uname -a`, `hostname`, `os-release`) |
-| 14:02:18 to 14:02:28 | Network discovery (`ip a`, `ss -tlnp`) |
-| 14:02:39 to 14:02:54 | `/etc/passwd`, `ps aux`, attempted `/etc/shadow` read |
-| 14:02:57 | Checked for Splunk, Sysmon, auditd, Wazuh, OSSEC |
-| 14:03 to 14:08 | Read wp-config.php, dumped `wp_users` (usernames and password hashes) |
-| 14:12:49 to 14:12:57 | More network discovery (`ip addr show`, `ip neigh`) |
-| 14:14:01 to 14:14:14 | Tried to stop sysmon and SplunkForwarder, checked status (failed) |
-| 14:15:49 | Staged `/dev/shm/.cache-helper` |
-| 14:16:00 | Added cron job running the implant every 5 minutes |
+| Morning | Nmap scan from 192.168.1.100 |
+| 08:18 | Exploit attempts start (PHP session warnings) |
+| 14:01 | First webshell command (`id`) |
+| 14:02 | Network discovery and security tool check |
+| 14:03 to 14:09 | Read wp-config.php and dumped wp_users |
+| 14:12 | More network discovery (`ip addr show`, `ip neigh`) |
+| 14:13 to 14:14 | Tried to stop the security tools (failed) |
+| 14:14 to 14:15 | Base64 exfiltration of wp-config.php and wp_users |
+| 14:15 to 14:16 | Staged `/dev/shm/.cache-helper` and added the cron job |
 
-## 🧠 Summary Table
+## MITRE ATT&CK
 
-| Flag | Description | Value |
-|---|---|---|
-| 1 | Scanner IP | 192.168.1.100 |
-| 2 | Recon tool | Nmap |
-| 3 | Exploited PHP feature | session.upload_progress |
-| 4 | Exploit signature | POST, multipart/form-data |
-| 5 | Webshell | health-check.php |
-| 6 | Execution account | www-data |
-| 7 | Webshell trigger header | X-HMG-Debug |
-| 8 | Command encoding | ROT13, then Base64 |
-| 9 | Network discovery | ip addr, ss, ip neigh |
-| 10 | Monitoring found | sysmon, auditd, splunk |
-| 11 | Credential file | wp-config.php |
-| 12 | Data dumped | wp_users, user_pass |
-| 13 | Services targeted | sysmon, auditd, SplunkForwarder |
-| 14 | Evasion outcome | Failed (no root) |
-| 15 | Persistence | Cron job |
-| 16 | Implant path | /dev/shm/.cache-helper |
-| 17 | Exfiltration | Base64 in webshell HTTP responses |
-| 18 | Lateral movement | None found |
-
-## 🎯 MITRE ATT&CK Mapping
-
-| Tactic | Technique | Evidence |
-|---|---|---|
-| Reconnaissance | T1595 Active Scanning / T1595.002 Vulnerability Scanning | Nmap NSE and rotating user agents |
-| Initial Access | T1190 Exploit Public-Facing Application | session.upload_progress exploit |
-| Persistence | T1505.003 Web Shell | health-check.php |
-| Execution | T1059.004 Unix Shell | `system()` commands as www-data |
-| Defense Evasion | T1027 Obfuscated Files or Information | ROT13 + Base64 in X-HMG-Debug |
-| Discovery | T1016 System Network Configuration Discovery | ip addr, ss, ip neigh |
-| Discovery | T1518.001 Security Software Discovery | dpkg grep for monitoring tools |
-| Credential Access | T1555 Credentials from Password Stores | wp-config.php, wp_users dump |
-| Defense Evasion | T1562.001 Disable or Modify Tools | systemctl stop (failed) |
-| Persistence | T1053.003 Cron | `*/5` crontab running the implant |
-| Exfiltration | T1041 Exfiltration Over C2 Channel | Base64 data returned through the webshell |
-
-## 🧾 Indicators of Compromise
-
-| Type | Value |
+| Technique | Evidence |
 |---|---|
-| IP | 192.168.1.100 |
-| File | /var/www/html/health-check.php |
-| File | /dev/shm/.cache-helper |
-| HTTP header | X-HMG-Debug |
-| Multipart boundary | ----0x4148php2shell |
-| User agent | Mozilla/5.0 (compatible; Nmap Scripting Engine; https://nmap.org/book/nse.html) |
-| Encoded prefix | ZmxmZ3J6 (Base64 of ROT13 `system(`) |
-| Cron entry | `*/5 * * * * /dev/shm/.cache-helper 300` |
+| T1595 / T1595.002 Active Scanning | Nmap scan |
+| T1190 Exploit Public-Facing Application | session.upload_progress exploit |
+| T1505.003 Web Shell | health-check.php |
+| T1059.004 Unix Shell | Commands run as www-data |
+| T1027 Obfuscated Files or Information | ROT13 + Base64 commands |
+| T1016 System Network Configuration Discovery | ip addr, ss, ip neigh |
+| T1518.001 Security Software Discovery | dpkg check for security tools |
+| T1555 Credentials from Password Stores | wp-config.php and wp_users |
+| T1562.001 Disable or Modify Tools | systemctl stop (failed) |
+| T1053.003 Cron | Cron job every 5 minutes |
+| T1036.005 Match Legitimate Name or Location | health-check.php, .cache-helper |
+| T1041 Exfiltration Over C2 Channel | Base64 data sent back through the webshell |
+| T1021 Remote Services | Checked, not found |
 
-## 🛡️ Recommended Response Actions
+## IOCs
 
-- Block 192.168.1.100 at the firewall
-- Remove `health-check.php`, delete `/dev/shm/.cache-helper`, and clear the www-data crontab
-- Patch PHP for the session.upload_progress vulnerability, or turn off `session.upload_progress.enabled` until it's patched
-- Rotate the WordPress database password and the auth keys and salts in wp-config.php
-- Force a password reset for every WordPress user, since their hashes were dumped
-- Add detections for the `X-HMG-Debug` header or any header value starting with `ZmxmZ3J6`, www-data spawning shells, and new files in `/dev/shm`
-- Since this is a healthcare organization, treat it as a possible data breach and involve whoever handles breach notification
+- IP: `192.168.1.100`
+- Webshell: `/var/www/html/health-check.php`
+- Implant: `/dev/shm/.cache-helper`
+- Header: `X-HMG-Debug`
+- Encoded command prefix: `ZmxmZ3J6`
 
-## 📘 Lessons Learned
+## Recommendations
 
-- **Standard access logs miss a lot.** The webshell's commands were hidden in a custom header, so they only showed up in the HTTP log built from packet capture, not in Apache's access log.
-- **Least privilege worked.** Because Apache runs as www-data, the attacker couldn't shut off the monitoring, and that's why I could see everything they did afterward.
-- **Test claims, don't assume them.** The lateral movement theory sounded believable, but the logs didn't support it.
-- **Summarize before you scroll.** Switching from listing every row to `summarize count() by Message` turned 75+ cut-off error lines into a handful of clear patterns.
-- **Setup matters.** Most of my time early on went to "Failed to resolve table" errors from being in the wrong workspace. Checking the resource group and using KQL mode fixed it.
+- Block 192.168.1.100
+- Remove the webshell, the implant, and the www-data cron job
+- Patch PHP or turn off `session.upload_progress` until it's patched
+- Change the database password and WordPress keys, and reset all WordPress user passwords
+- Alert on the X-HMG-Debug header, www-data running shell commands, and new files in /dev/shm
+
+## What I Learned
+
+- The normal Apache log missed the most important part. The commands were hidden in a header and only showed up in the enriched HTTP log.
+- Running Apache as a low-privilege account stopped the attacker from turning off monitoring, which is why the full attack was visible.
+- It's worth testing claims instead of assuming them. The lateral movement theory didn't hold up.
